@@ -1,0 +1,8 @@
+customtkinter
+faster-whisper
+PyAudioWPatch
+numpy
+proc-tap
+pycaw
+psutil
+pyinstaller

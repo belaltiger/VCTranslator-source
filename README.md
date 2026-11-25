@@ -1,1 +1,0 @@
-# VCTranslator-source
