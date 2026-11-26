@@ -79,10 +79,17 @@ CUDA_DIR = DATA / "cuda"
 def cuda_libs_ready():
     return any(CUDA_DIR.glob("cublas64_12.dll")) and any(CUDA_DIR.glob("cudnn64_9.dll"))
 
+def log(msg):
+    try:
+        with open(DATA / "log.txt", "a", encoding="utf-8") as f: f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+    except Exception: pass
+
 def use_cuda_libs():
-    if CUDA_DIR.exists():
-        os.add_dll_directory(str(CUDA_DIR))
-        os.environ["PATH"] = str(CUDA_DIR) + os.pathsep + os.environ["PATH"]
+    if not CUDA_DIR.exists(): return
+    os.add_dll_directory(str(CUDA_DIR))
+    os.environ["PATH"] = str(CUDA_DIR) + os.pathsep + os.environ["PATH"]
+    for n in ("cublasLt64_12.dll", "cublas64_12.dll", "cudnn64_9.dll"):  # load now so any problem shows a clear error
+        if (CUDA_DIR / n).exists(): ctypes.WinDLL(str(CUDA_DIR / n))
 
 def fetch_cuda_libs(post):
     import urllib.request, zipfile, shutil
@@ -103,17 +110,20 @@ def fetch_cuda_libs(post):
 def load_model(name, use_gpu, post):
     import ctranslate2
     from faster_whisper import WhisperModel
-    plan = []
+    plan, note = [], ""
     if use_gpu:
         try:
-            if ctranslate2.get_cuda_device_count() > 0:
+            n = ctranslate2.get_cuda_device_count()
+            log(f"ctranslate2 {ctranslate2.__version__}, cuda devices: {n}, libs ready: {cuda_libs_ready()}")
+            if n > 0:
                 if not cuda_libs_ready(): fetch_cuda_libs(post)
                 use_cuda_libs()
                 plan += [("cuda", "float16"), ("cuda", "int8_float16")]
             else:
-                post("status", "No NVIDIA GPU found, using the CPU.")
+                note = "the engine found no NVIDIA GPU"
         except Exception as e:
-            post("status", f"GPU setup skipped ({e}), using the CPU.")
+            note = f"GPU setup failed: {str(e)[:220]}"
+    if note: log(note)
     plan.append(("cpu", "int8"))
     post("status", f"Loading the {name} model (the first time it downloads)…")
     last = None
@@ -121,15 +131,18 @@ def load_model(name, use_gpu, post):
         try:
             m = WhisperModel(name, device=dev, compute_type=ct, download_root=str(DATA / "models"))
             list(m.transcribe(np.zeros(RATE, dtype=np.float32), beam_size=1)[0])  # warm-up proves the GPU libs work
-            return m, ("GPU" if dev == "cuda" else "CPU")
+            log(f"model {name} loaded on {dev}/{ct}")
+            return m, ("GPU" if dev == "cuda" else "CPU"), note
         except Exception as e:
             last = e
+            log(f"{dev}/{ct} failed: {e}")
+            if dev == "cuda": note = f"GPU failed: {str(e)[:220]}"
     raise last
 
 class Engine:
     def __init__(self, post):
         self.post, self.run, self.gen = post, False, 0
-        self.model = self.key_loaded = None; self.where = "CPU"
+        self.model = self.key_loaded = None; self.where, self.note = "CPU", ""
 
     def start(self, dev, lang, quality, hide, gpu):
         self.gen += 1; self.run = True
@@ -142,13 +155,15 @@ class Engine:
 
     def stop(self): self.run = False
 
+    def tag(self): return f"({self.where})" + (f" - {self.note}" if self.note else "")
+
     def alive(self, g): return self.run and g == self.gen
 
     def _boot(self, g):
         try:
             key = (self.mname, self.gpu)
             if self.key_loaded != key:
-                self.model, self.where = load_model(self.mname, self.gpu, self.post); self.key_loaded = key
+                self.model, self.where, self.note = load_model(self.mname, self.gpu, self.post); self.key_loaded = key
             if not self.alive(g): return
             threading.Thread(target=self._segment, args=(g,), daemon=True).start()
             threading.Thread(target=self._transcribe, args=(g,), daemon=True).start()
@@ -169,7 +184,7 @@ class Engine:
                 tap.start()
             except Exception as e:
                 raise RuntimeError(f"{e} | proctap offers: {[n for n in dir(proctap) if not n.startswith('_')]}")
-            self.post("status", f"Listening to the app… ({self.where})")
+            self.post("status", f"Listening to the app… {self.tag()}")
             try:
                 while self.alive(g): time.sleep(0.1)
             finally:
@@ -183,7 +198,7 @@ class Engine:
             self.audio_q.put(data); return (None, pa.paContinue)
         s = p.open(format=pa.paInt16, channels=self.ch, rate=self.rate, frames_per_buffer=self.rate // 10,
                    input=True, input_device_index=self.dev["index"], stream_callback=cb)
-        self.post("status", f"Listening… ({self.where})")
+        self.post("status", f"Listening… {self.tag()}")
         try:
             while self.alive(g): time.sleep(0.1)
         finally:
