@@ -157,15 +157,19 @@ class Engine:
 
     def _capture(self, g):
         if self.dev["kind"] == "app":  # one app only (Windows process loopback)
-            from proctap import ProcTap, StreamConfig
-            tap = ProcTap(self.dev["pid"], StreamConfig(sample_rate=48000, channels=2, width=2),
-                          on_data=lambda pcm, frames: self.audio_q.put(bytes(pcm)))
+            import proctap
+            Tap = getattr(proctap, "ProcessAudioCapture", None) or getattr(proctap, "ProcTap", None)
+            if Tap is None:
+                raise RuntimeError("proctap has no capture class: " + str([n for n in dir(proctap) if not n.startswith("_")]))
+            tap = Tap(self.dev["pid"], config=proctap.StreamConfig(sample_rate=48000, channels=2),
+                      on_data=lambda pcm, frames: self.audio_q.put(bytes(pcm)))
             tap.start(); self.post("status", f"Listening to the app… ({self.where})")
             try:
                 while self.alive(g): time.sleep(0.1)
             finally:
-                try: tap.close()
-                except Exception: pass
+                for fn in ("stop", "close"):
+                    try: getattr(tap, fn)()
+                    except Exception: pass
             return
         import pyaudiowpatch as pa
         p = pa.PyAudio()
@@ -179,12 +183,20 @@ class Engine:
         finally:
             s.stop_stream(); s.close(); p.terminate()
 
+    def _pcm(self, raw):
+        if self.dev["kind"] == "app" and len(raw) % 4 == 0:  # per-app capture delivers float32
+            f = np.frombuffer(raw, dtype=np.float32)
+            if len(f) == 0 or (np.isfinite(f).all() and float(np.abs(f).max()) <= 8.0):
+                return f.astype(np.float32)
+        n = len(raw) // 2 * 2
+        return np.frombuffer(raw[:n], dtype=np.int16).astype(np.float32) / 32768.0
+
     def _segment(self, g):
         buf, pre, silence, speaking = [], deque(maxlen=3), 0.0, False
         while self.alive(g):
             try: raw = self.audio_q.get(timeout=0.3)
             except queue.Empty: continue
-            x = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+            x = self._pcm(raw)
             if self.ch > 1: x = x[: len(x) // self.ch * self.ch].reshape(-1, self.ch).mean(1)
             x = to16k(x, self.rate)
             rms = float(np.sqrt(np.mean(x * x))) if len(x) else 0.0
