@@ -24,6 +24,7 @@ QUALITY = {"Fast": ("base", 4.0, 1, "Small model, short chunks. Quickest, least 
            "Balanced": ("small", 6.0, 3, "Good mix of speed and accuracy."),
            "Best": ("medium", 10.0, 5, "Most accurate. ~1.5 GB download, best with the GPU on.")}
 RATE = 16000
+OVW, OVH, KEY = 640, 360, "#010203"
 ACC, CARD, BD, BG, MUT, IN = "#7c5cff", "#141720", "#242836", "#0b0d12", "#868c9d", "#1b1f2a"
 DEFAULT = {"src": "", "lang": "Auto-detect", "quality": "Balanced", "hide": True,
            "where": "Chat window", "lock": True, "gpu": True}
@@ -161,9 +162,14 @@ class Engine:
             Tap = getattr(proctap, "ProcessAudioCapture", None) or getattr(proctap, "ProcTap", None)
             if Tap is None:
                 raise RuntimeError("proctap has no capture class: " + str([n for n in dir(proctap) if not n.startswith("_")]))
-            tap = Tap(self.dev["pid"], config=proctap.StreamConfig(sample_rate=48000, channels=2),
-                      on_data=lambda pcm, frames: self.audio_q.put(bytes(pcm)))
-            tap.start(); self.post("status", f"Listening to the app… ({self.where})")
+            pid, cb = self.dev["pid"], (lambda pcm, frames: self.audio_q.put(bytes(pcm)))
+            try:
+                try: tap = Tap(pid, on_data=cb)
+                except TypeError: tap = Tap(pid=pid, on_data=cb)
+                tap.start()
+            except Exception as e:
+                raise RuntimeError(f"{e} | proctap offers: {[n for n in dir(proctap) if not n.startswith('_')]}")
+            self.post("status", f"Listening to the app… ({self.where})")
             try:
                 while self.alive(g): time.sleep(0.1)
             finally:
@@ -227,7 +233,7 @@ class Engine:
                 self.post("status", f"Transcribe error: {e}"); continue
             if len(text) < 2: continue
             if self.hide and info.language == "en": continue
-            self.post("line", text)
+            self.post("line", (text, info.language or "??"))
 
 class App(ctk.CTk):
     def __init__(self):
@@ -330,9 +336,10 @@ class App(ctk.CTk):
         self.go.configure(text="■  Stop listening" if v else "▷  Start listening", fg_color="#e5484d" if v else ACC)
         self.pill.configure(text="● On" if v else "● Off", text_color="#2fbf71" if v else MUT)
 
-    def add_line(self, text):
-        self.box.insert("1.0", text + "\n\n"); self.lines.append((time.time(), text))
-        self.lines = self.lines[-30:]
+    def add_line(self, item):
+        text, lang = item if isinstance(item, tuple) else (item, "??")
+        self.box.insert("1.0", f"[{lang.upper()}] {text}\n\n")
+        self.lines = (self.lines + [(time.time(), text, lang)])[-30:]
 
     def on_where(self, v):
         if v == "Game overlay": self.show_overlay()
@@ -340,16 +347,25 @@ class App(ctk.CTk):
 
     def show_overlay(self):
         if self.overlay: return
-        o = tk.Toplevel(self); o.overrideredirect(True); o.attributes("-topmost", True); o.attributes("-alpha", 0.88)
-        o.configure(bg=BG); o.geometry(f"640x150+{(self.winfo_screenwidth() - 640) // 2}+60")
-        self.ov = tk.Label(o, text="", justify="left", anchor="sw", fg="white", bg=BG, font=("Segoe UI", 18, "bold"), wraplength=620)
-        self.ov.pack(fill="both", expand=True, padx=10, pady=8)
-        for w in (o, self.ov):
-            w.bind("<ButtonPress-1>", self._ds); w.bind("<B1-Motion>", self._dm)
-        self.overlay = o; self.after(250, self.apply_lock)
+        o = tk.Toplevel(self); o.overrideredirect(True); o.attributes("-topmost", True)
+        o.configure(bg=KEY); o.attributes("-transparentcolor", KEY)
+        x, y = self.cfg.get("ovx"), self.cfg.get("ovy")
+        if x is None: x, y = (self.winfo_screenwidth() - OVW) // 2, 80
+        o.geometry(f"{OVW}x{OVH}+{x}+{y}")
+        self.cv = tk.Canvas(o, width=OVW, height=OVH, bg=KEY, highlightthickness=0)
+        self.cv.pack(fill="both", expand=True)
+        self.cv.bind("<ButtonPress-1>", self._ds); self.cv.bind("<B1-Motion>", self._dm); self.cv.bind("<ButtonRelease-1>", self._de)
+        self._sig = None; self.overlay = o; self.after(250, self.apply_lock)
 
     def _ds(self, e): self._dx, self._dy = e.x_root - self.overlay.winfo_x(), e.y_root - self.overlay.winfo_y()
     def _dm(self, e): self.overlay.geometry(f"+{e.x_root - self._dx}+{e.y_root - self._dy}")
+    def _de(self, e):
+        self.cfg["ovx"], self.cfg["ovy"] = self.overlay.winfo_x(), self.overlay.winfo_y(); self.save()
+
+    def rrect(self, x1, y1, x2, y2, r, **kw):
+        pts = [x1+r,y1, x1+r,y1, x2-r,y1, x2-r,y1, x2,y1, x2,y1+r, x2,y1+r, x2,y2-r, x2,y2-r, x2,y2,
+               x2-r,y2, x2-r,y2, x1+r,y2, x1+r,y2, x1,y2, x1,y2-r, x1,y2-r, x1,y1+r, x1,y1+r, x1,y1]
+        return self.cv.create_polygon(pts, smooth=True, **kw)
 
     def apply_lock(self):
         if not self.overlay: return
@@ -363,8 +379,24 @@ class App(ctk.CTk):
 
     def refresh_overlay(self):
         if not self.overlay: return
-        now = time.time()
-        self.ov.configure(text="\n".join([t for ts, t in self.lines if now - ts < 15][-4:]))
+        now, locked = time.time(), bool(self.lock.get())
+        live = [(t, l) for ts, t, l in self.lines if now - ts < min(14, 4 + 0.07 * len(t))][-5:]
+        sig = (tuple(live), locked)
+        if sig == getattr(self, "_sig", None): return
+        self._sig = sig
+        cv = self.cv; cv.delete("all"); y = 8
+        if not locked:  # visible, draggable area plus the hint
+            self.rrect(2, 2, OVW - 2, OVH - 2, 14, fill="#12141b", outline=ACC, width=2)
+            cv.create_text(20, 24, text="Drag to position. Lock the overlay in the app when done.", anchor="w", fill="white", font=("Segoe UI", 11, "bold"))
+            y = 52
+        for text, lang in live:
+            chip = self.rrect(16, y + 9, 52, y + 31, 6, fill="#2b2644")
+            cv.create_text(34, y + 20, text=lang.upper()[:3], fill="#a58bff", font=("Segoe UI", 9, "bold"))
+            tid = cv.create_text(64, y + 8, text=text, anchor="nw", fill="white", font=("Segoe UI", 15, "bold"), width=OVW - 94)
+            x2, y2 = cv.bbox(tid)[2:]
+            bottom = max(y2 + 8, y + 40)
+            cv.tag_lower(self.rrect(8, y, x2 + 14, bottom, 12, fill="#16181f"), chip)
+            y = bottom + 6
 
     def check_now(self):
         self.ubtn.configure(text="Checking…", state="disabled")
