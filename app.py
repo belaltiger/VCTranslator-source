@@ -94,12 +94,21 @@ def use_cuda_libs():
 def fetch_cuda_libs(post):
     import urllib.request, zipfile, shutil
     CUDA_DIR.mkdir(parents=True, exist_ok=True)
+    vkey = lambda v: tuple(int(x) for x in v.split(".") if x.isdigit())
     for pkg in ("nvidia-cublas-cu12", "nvidia-cudnn-cu12"):
-        post("status", f"Downloading GPU libraries ({pkg}) - one time, about 1 GB in total…")
+        post("status", f"Looking up GPU libraries ({pkg})…")
         info = json.load(urllib.request.urlopen(f"https://pypi.org/pypi/{pkg}/json", timeout=30))
-        wheel = next(f for f in info["urls"] if f["filename"].endswith(".whl") and "win_amd64" in f["filename"])
+        best = None  # newest release that actually has a Windows wheel
+        for ver, files in info["releases"].items():
+            for f in files:
+                if f["filename"].endswith(".whl") and "win_amd64" in f["filename"] and not f.get("yanked"):
+                    if best is None or vkey(ver) > best[0]: best = (vkey(ver), f)
+        if not best: raise RuntimeError(f"no Windows download found for {pkg}")
         tmp = DATA / (pkg + ".whl")
-        urllib.request.urlretrieve(wheel["url"], tmp)
+        def hook(b, bs, total, pkg=pkg):
+            if total > 0 and b % 100 == 0: post("status", f"Downloading {pkg}: {min(100, int(b * bs * 100 / total))}% (one time)")
+        urllib.request.urlretrieve(best[1]["url"], tmp, hook)
+        post("status", f"Unpacking {pkg}…")
         with zipfile.ZipFile(tmp) as z:
             for n in z.namelist():
                 if n.lower().endswith(".dll"):
@@ -118,11 +127,14 @@ def load_model(name, use_gpu, post):
             if n > 0:
                 if not cuda_libs_ready(): fetch_cuda_libs(post)
                 use_cuda_libs()
-                plan += [("cuda", "float16"), ("cuda", "int8_float16")]
+                try: sup = set(ctranslate2.get_supported_compute_types("cuda"))
+                except Exception: sup = {"float16", "int8_float16", "int8", "float32"}
+                log(f"supported GPU compute types: {sorted(sup)}")
+                plan += [("cuda", c) for c in ("float16", "int8_float16", "int8", "float32") if c in sup]
             else:
                 note = "the engine found no NVIDIA GPU"
         except Exception as e:
-            note = f"GPU setup failed: {str(e)[:220]}"
+            note = f"GPU setup failed: {type(e).__name__}: {str(e)[:200]}"
     if note: log(note)
     plan.append(("cpu", "int8"))
     post("status", f"Loading the {name} model (the first time it downloads)…")
